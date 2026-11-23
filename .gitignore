@@ -1,0 +1,18 @@
+# Build directories
+build/
+bin/
+out/
+.vs/
+*.user
+
+# Object & binary files
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.dll
+
+# OS files
+.DS_Store
+Thumbs.db
