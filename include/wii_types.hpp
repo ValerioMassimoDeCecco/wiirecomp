@@ -1,6 +1,10 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <mutex>
+#include <cstdio>
+#include <windows.h>
 
 #if defined(_MSC_VER)
     #include <intrin.h>
@@ -14,6 +18,31 @@
 #endif
 
 namespace WiiPort {
+
+inline void Log(const std::string& msg) {
+    static std::mutex s_LogMutex;
+    std::lock_guard<std::mutex> lock(s_LogMutex);
+    static FILE* f = fopen("native_runtime.log", "a");
+    if (f) {
+        fprintf(f, "%s\n", msg.c_str());
+        fflush(f);
+    }
+    OutputDebugStringA((msg + "\n").c_str());
+}
+
+inline std::string HexStr(uint32_t val) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "0x%08X", val);
+    return std::string(buf);
+}
+
+inline uint64_t GetTimeBaseTicks() {
+    static LARGE_INTEGER freq;
+    static bool init = (QueryPerformanceFrequency(&freq), true);
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (uint64_t)((double)counter.QuadPart * (121500000.0 / (double)freq.QuadPart));
+}
 
 // Rappresentazione del registro a 64-bit per Paired-Single SIMD
 union alignas(8) PairedSingle {
@@ -83,5 +112,7 @@ struct alignas(64) PPCContext {
         cr = (cr & ~(0xF << shift)) | ((val & 0xF) << shift);
     }
 };
+
+extern PPCContext g_GameContext;
 
 } // namespace WiiPort

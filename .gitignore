@@ -1,11 +1,11 @@
-# Build directories
+# Build & Binary Directories
 build/
 bin/
 out/
 .vs/
 *.user
 
-# Object & binary files
+# Compiled Artifacts & Object Files
 *.obj
 *.exe
 *.pdb
@@ -13,6 +13,19 @@ out/
 *.lib
 *.dll
 
-# OS files
+# Logs, Dumps & Temporary Test Files
+*.log
+*.bin
+dolphin_out.txt
+test_recomp.cpp
+run_test.ps1
+*.dol
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# OS & Editor Files
 .DS_Store
 Thumbs.db
+Desktop.ini

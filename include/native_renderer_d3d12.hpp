@@ -78,10 +78,170 @@ public:
     ID3D12Resource* vertexBuffer = nullptr;
     D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
 
+    // Risorse per visualizzazione del framebuffer nativo Wii (XFB / YUYV422)
+    ID3D12Resource* xfbTexture = nullptr;
+    ID3D12Resource* xfbUpload = nullptr;
+    ID3D12DescriptorHeap* srvHeap = nullptr;
+
     UINT frameIndex = 0;
     HANDLE fenceEvent = nullptr;
     ID3D12Fence* fence = nullptr;
     UINT64 fenceValue = 0;
+
+    bool CreateXfbPipeline() {
+        // 1. Root Signature con 1 SRV (t0) e 1 Static Sampler (s0)
+        D3D12_DESCRIPTOR_RANGE range = {};
+        range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        range.NumDescriptors = 1;
+        range.BaseShaderRegister = 0;
+        range.RegisterSpace = 0;
+        range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER rootParam = {};
+        rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParam.DescriptorTable.NumDescriptorRanges = 1;
+        rootParam.DescriptorTable.pDescriptorRanges = &range;
+        rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC sampler = {};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.ShaderRegister = 0;
+        sampler.RegisterSpace = 0;
+        sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
+        rsDesc.NumParameters = 1;
+        rsDesc.pParameters = &rootParam;
+        rsDesc.NumStaticSamplers = 1;
+        rsDesc.pStaticSamplers = &sampler;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        ID3DBlob* signatureBlob = nullptr;
+        ID3DBlob* errorBlob = nullptr;
+        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &signatureBlob, &errorBlob))) {
+            if (errorBlob) {
+                std::cerr << "[D3D12] Errore serializzazione Root Signature: " << (char*)errorBlob->GetBufferPointer() << "\n";
+                errorBlob->Release();
+            }
+            return false;
+        }
+        if (FAILED(device->CreateRootSignature(0, signatureBlob->GetBufferPointer(), signatureBlob->GetBufferSize(), IID_PPV_ARGS(&rootSignature)))) {
+            signatureBlob->Release();
+            return false;
+        }
+        signatureBlob->Release();
+
+        // 2. Compilazione Shaders HLSL per Fullscreen Quad
+        const char* xfbShaderCode = R"(
+            struct PS_INPUT {
+                float4 pos : SV_POSITION;
+                float2 uv  : TEXCOORD0;
+            };
+            PS_INPUT VSMain(uint vid : SV_VertexID) {
+                PS_INPUT o;
+                o.uv = float2((vid << 1) & 2, vid & 2);
+                o.pos = float4(o.uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+                return o;
+            }
+            Texture2D    g_Texture : register(t0);
+            SamplerState g_Sampler : register(s0);
+            float4 PSMain(PS_INPUT i) : SV_Target {
+                return g_Texture.Sample(g_Sampler, i.uv);
+            }
+        )";
+
+        ID3DBlob* vsBlob = nullptr;
+        ID3DBlob* psBlob = nullptr;
+        HRESULT hr = D3DCompile(xfbShaderCode, strlen(xfbShaderCode), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) { std::cerr << "[D3D12] VS Compile error: " << (char*)errorBlob->GetBufferPointer() << "\n"; errorBlob->Release(); }
+            return false;
+        }
+        hr = D3DCompile(xfbShaderCode, strlen(xfbShaderCode), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psBlob, &errorBlob);
+        if (FAILED(hr)) {
+            if (errorBlob) { std::cerr << "[D3D12] PS Compile error: " << (char*)errorBlob->GetBufferPointer() << "\n"; errorBlob->Release(); }
+            vsBlob->Release();
+            return false;
+        }
+
+        // 3. Pipeline State Object (PSO)
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = rootSignature;
+        psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
+        psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
+        psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psoDesc.SampleMask = UINT_MAX;
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psoDesc.NumRenderTargets = 1;
+        psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        psoDesc.SampleDesc.Count = 1;
+
+        hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pipelineState));
+        vsBlob->Release();
+        psBlob->Release();
+        if (FAILED(hr)) return false;
+
+        // 4. Descriptor Heap per SRV (Shader-Visible)
+        D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+        srvHeapDesc.NumDescriptors = 1;
+        srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&srvHeap)))) return false;
+
+        // 5. Creazione XFB 2D Texture (640x480 RGBA8)
+        D3D12_HEAP_PROPERTIES defaultHeapProps = {};
+        defaultHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width = 640;
+        texDesc.Height = 480;
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+        if (FAILED(device->CreateCommittedResource(
+            &defaultHeapProps, D3D12_HEAP_FLAG_NONE,
+            &texDesc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            nullptr, IID_PPV_ARGS(&xfbTexture)))) return false;
+
+        // SRV per la texture
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(xfbTexture, &srvDesc, srvHeap->GetCPUDescriptorHandleForHeapStart());
+
+        // 6. Creazione Upload Buffer per la texture (640 * 4 * 480 = 1228800 byte)
+        D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+        uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+        D3D12_RESOURCE_DESC uploadDesc = {};
+        uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDesc.Width = 640 * 480 * 4;
+        uploadDesc.Height = 1;
+        uploadDesc.DepthOrArraySize = 1;
+        uploadDesc.MipLevels = 1;
+        uploadDesc.Format = DXGI_FORMAT_UNKNOWN;
+        uploadDesc.SampleDesc.Count = 1;
+        uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        if (FAILED(device->CreateCommittedResource(
+            &uploadHeapProps, D3D12_HEAP_FLAG_NONE,
+            &uploadDesc, D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr, IID_PPV_ARGS(&xfbUpload)))) return false;
+
+        return true;
+    }
 
     bool Initialize(HWND windowHandle, uint32_t w, uint32_t h) {
         hwnd = windowHandle;
@@ -90,7 +250,19 @@ public:
 
         // 1. Creazione Factory DXGI & Device D3D12
         if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
-        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) return false;
+        HRESULT hr = D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+        if (FAILED(hr)) {
+            std::cout << "[D3D12] Hardware device non disponibile, fallback su software WARP adapter...\n";
+            IDXGIAdapter* warpAdapter = nullptr;
+            if (SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warpAdapter)))) {
+                hr = D3D12CreateDevice(warpAdapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
+                warpAdapter->Release();
+            }
+        }
+        if (FAILED(hr) || !device) {
+            std::cerr << "[D3D12] Creazione D3D12 device fallita (HRESULT: 0x" << std::hex << hr << std::dec << ")\n";
+            return false;
+        }
 
         // 2. Creazione Command Queue
         D3D12_COMMAND_QUEUE_DESC queueDesc = {};
@@ -138,16 +310,95 @@ public:
         if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return false;
         fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
 
-        std::cout << "[D3D12] Pipeline DirectX 12 inizializzata con successo (" << width << "x" << height << ")\n";
+        // 7. Pipeline grafica per XFB (External Framebuffer / libogc video)
+        if (!CreateXfbPipeline()) {
+            std::cout << "[D3D12] Avviso: pipeline XFB texture non inizializzata, rendering solo clear.\n";
+            Log("[D3D12] Avviso: pipeline XFB texture non inizializzata, rendering solo clear.");
+        }
+
+        std::string d3dMsg = "[D3D12] Pipeline DirectX 12 inizializzata con successo (" + std::to_string(width) + "x" + std::to_string(height) + ")";
+        std::cout << d3dMsg << "\n";
+        Log(d3dMsg);
         return true;
     }
 
-    // Renderizza la geometria estratta dal GX Command Processor e sincronizza con VSync
-    void RenderFrame(const std::vector<UniversalVertex>& vertices) {
-        if (vertices.empty()) return;
+    // Renderizza il framebuffer nativo Wii (XFB) e la geometria GX con VSync
+    void RenderFrame(const std::vector<UniversalVertex>& vertices, uint8_t* mem1 = nullptr, uint32_t fbAddr = 0) {
+        if (!device || !swapChain || !commandAllocator || !commandList) return;
 
         commandAllocator->Reset();
         commandList->Reset(commandAllocator, pipelineState);
+
+        // Se è presente un framebuffer XFB (da VI_SetFramebuffer / CON_Init / YUYV422), caricalo nella texture
+        if (fbAddr != 0 && mem1 != nullptr && xfbUpload && xfbTexture) {
+            uint8_t* pUpload = nullptr;
+            D3D12_RANGE readRange = { 0, 0 };
+            if (SUCCEEDED(xfbUpload->Map(0, &readRange, reinterpret_cast<void**>(&pUpload)))) {
+                const uint8_t* pSrc = mem1 + (fbAddr & 0x07FFFFFF);
+                uint32_t* pDst = reinterpret_cast<uint32_t*>(pUpload);
+
+                for (uint32_t y = 0; y < 480; ++y) {
+                    for (uint32_t x = 0; x < 640; x += 2) {
+                        uint8_t y0 = pSrc[0];
+                        uint8_t u  = pSrc[1];
+                        uint8_t y1 = pSrc[2];
+                        uint8_t v  = pSrc[3];
+                        pSrc += 4;
+
+                        int c0 = (int)y0 - 16; if (c0 < 0) c0 = 0;
+                        int c1 = (int)y1 - 16; if (c1 < 0) c1 = 0;
+                        int d = (int)u - 128;
+                        int e = (int)v - 128;
+
+                        auto ToRgba = [](int c, int d, int e) -> uint32_t {
+                            int r = (298 * c + 409 * e + 128) >> 8;
+                            int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+                            int b = (298 * c + 516 * d + 128) >> 8;
+                            if (r < 0) r = 0; else if (r > 255) r = 255;
+                            if (g < 0) g = 0; else if (g > 255) g = 255;
+                            if (b < 0) b = 0; else if (b > 255) b = 255;
+                            return (0xFF000000u) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
+                        };
+
+                        pDst[y * 640 + x]     = ToRgba(c0, d, e);
+                        pDst[y * 640 + x + 1] = ToRgba(c1, d, e);
+                    }
+                }
+                xfbUpload->Unmap(0, nullptr);
+
+                // Barriera: da PIXEL_SHADER_RESOURCE a COPY_DEST
+                D3D12_RESOURCE_BARRIER bCopy = {};
+                bCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                bCopy.Transition.pResource = xfbTexture;
+                bCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                bCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                bCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                commandList->ResourceBarrier(1, &bCopy);
+
+                // Copia da buffer a 2D texture (rowPitch = 640 * 4 = 2560)
+                D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+                dstLoc.pResource = xfbTexture;
+                dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dstLoc.SubresourceIndex = 0;
+
+                D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+                srcLoc.pResource = xfbUpload;
+                srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                srcLoc.PlacedFootprint.Offset = 0;
+                srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                srcLoc.PlacedFootprint.Footprint.Width = 640;
+                srcLoc.PlacedFootprint.Footprint.Height = 480;
+                srcLoc.PlacedFootprint.Footprint.Depth = 1;
+                srcLoc.PlacedFootprint.Footprint.RowPitch = 2560;
+
+                commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+                // Barriera: da COPY_DEST a PIXEL_SHADER_RESOURCE
+                bCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                bCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                commandList->ResourceBarrier(1, &bCopy);
+            }
+        }
 
         // Imposta la transizione da Present a Render Target
         D3D12_RESOURCE_BARRIER barrier = {};
@@ -155,14 +406,31 @@ public:
         barrier.Transition.pResource = renderTargets[frameIndex];
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         commandList->ResourceBarrier(1, &barrier);
 
         UINT rtvDescriptorSize = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle(rtvHeap->GetCPUDescriptorHandleForHeapStart());
         rtvHandle.ptr += frameIndex * rtvDescriptorSize;
 
-        const float clearColor[] = { 0.1f, 0.1f, 0.15f, 1.0f };
+        commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+        const float clearColor[] = { 0.05f, 0.05f, 0.05f, 1.0f }; // Nero elegante (mai bianco)
         commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+
+        if (fbAddr != 0 && srvHeap && pipelineState && rootSignature) {
+            commandList->SetGraphicsRootSignature(rootSignature);
+            ID3D12DescriptorHeap* ppHeaps[] = { srvHeap };
+            commandList->SetDescriptorHeaps(1, ppHeaps);
+            commandList->SetGraphicsRootDescriptorTable(0, srvHeap->GetGPUDescriptorHandleForHeapStart());
+
+            D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
+            D3D12_RECT sr = { 0, 0, (LONG)width, (LONG)height };
+            commandList->RSSetViewports(1, &vp);
+            commandList->RSSetScissorRects(1, &sr);
+
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            commandList->DrawInstanced(3, 1, 0, 0);
+        }
 
         // Transizione di ritorno a Present
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;

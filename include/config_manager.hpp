@@ -29,7 +29,13 @@ struct GameConfig {
     std::string dataDirectory = "./game_data/";
 
     bool LoadFromFile(const std::string& path = "config.ini") {
-        std::ifstream file(path);
+        std::vector<std::string> searchPaths = { path, "config.ini", "../config.ini", "../../config.ini", "C:/Users/Valerio/Desktop/wiirecomp/config.ini" };
+        std::ifstream file;
+        for (const auto& p : searchPaths) {
+            file.open(p);
+            if (file.is_open()) break;
+            file.clear();
+        }
         if (!file.is_open()) return false;
 
         std::string line;

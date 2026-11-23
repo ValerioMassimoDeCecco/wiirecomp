@@ -98,8 +98,9 @@ public:
             }
         }
 
-        std::cout << "[DOL] Caricato con successo: " << sections.size() << " sezioni, EntryPoint: 0x"
-                  << std::hex << entryPoint << std::dec << std::endl;
+        char logBuf[256];
+        snprintf(logBuf, sizeof(logBuf), "[DOL] Caricato con successo: %zu sezioni, EntryPoint: 0x%08X", sections.size(), entryPoint);
+        Log(logBuf);
         return true;
     }
 

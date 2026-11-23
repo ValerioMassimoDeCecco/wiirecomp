@@ -43,6 +43,7 @@ public:
 
     // Esegue il pre-hook se presente
     inline bool ExecutePreHook(uint32_t addr, PPCContext* ctx) {
+        ctx->pc = addr;
         auto it = preHooks.find(addr);
         if (it != preHooks.end()) {
             return it->second(ctx); // Se true, salta l'implementazione originale

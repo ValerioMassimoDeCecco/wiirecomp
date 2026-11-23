@@ -12,23 +12,8 @@ add_executable(wiirecomp
 )
 
 # 2. Libreria Runtime Nativo Windows
-add_library(WiiNativeRuntime STATIC
-    include/wii_types.hpp
-    include/wii_runtime.hpp
-    include/ppc_bitops.hpp
-    include/gx_fifo.hpp
-    include/ios_ipc.hpp
-    include/rel_loader.hpp
-    include/iso_fs_reader.hpp
-    include/symbol_map_importer.hpp
-    include/mod_engine.hpp
-    include/config_manager.hpp
-    include/native_renderer_d3d12.hpp
-    include/audio_xaudio2.hpp
-    include/input_manager.hpp
-)
-
-target_include_directories(WiiNativeRuntime PUBLIC include)
+add_library(WiiNativeRuntime INTERFACE)
+target_include_directories(WiiNativeRuntime INTERFACE include)
 
 # 3. Target del Gioco Finale Nativo (Windows Win32 / DirectX 12)
 # Quando 'recompiled_game.cpp' viene generato da wiirecomp, questo target produce Game_Native.exe
@@ -47,3 +32,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/recompiled_game.cpp")
         xinput
     )
 endif()
+
+# 4. Interfaccia Grafica con Console in Tempo Reale (Studio GUI)
+add_executable(WiiRecomp_Studio WIN32
+    src/gui/main_gui.cpp
+)
+target_link_libraries(WiiRecomp_Studio PRIVATE
+    comctl32
+    dwmapi
+    shell32
+)
