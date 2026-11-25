@@ -4,6 +4,7 @@
 #include <string>
 #include <mutex>
 #include <cstdio>
+#include <iostream>
 #include <windows.h>
 
 #if defined(_MSC_VER)
@@ -30,6 +31,16 @@ inline void Log(const std::string& msg) {
     OutputDebugStringA((msg + "\n").c_str());
 }
 
+// Come Log(), ma scrive anche sulla console visibile all'utente (per gli eventi importanti)
+inline void LogConsole(const std::string& msg) {
+    Log(msg);
+    std::cout << msg << std::endl;
+}
+
+struct PPCLongJmpException {
+    uint32_t targetLr;
+};
+
 inline std::string HexStr(uint32_t val) {
     char buf[16];
     snprintf(buf, sizeof(buf), "0x%08X", val);
@@ -44,15 +55,17 @@ inline uint64_t GetTimeBaseTicks() {
     return (uint64_t)((double)counter.QuadPart * (121500000.0 / (double)freq.QuadPart));
 }
 
-// Rappresentazione del registro a 64-bit per Paired-Single SIMD
-union alignas(8) PairedSingle {
-    double d;
-    float  ps[2]; // ps[0] = componente alta (ps0), ps[1] = componente bassa (ps1)
-    uint64_t u64;
-    struct {
-        uint32_t hi;
-        uint32_t lo;
-    } raw;
+// Rappresentazione del registro a 64-bit / Paired-Single SIMD (modello Broadway PSE=1)
+struct alignas(16) PairedSingle {
+    union {
+        double d;
+        uint64_t u64;
+        struct {
+            uint32_t lo;
+            uint32_t hi;
+        } raw;
+    };
+    float ps[2]; // ps[0] = componente alta (ps0), ps[1] = componente bassa (ps1)
 };
 
 // Graphics Quantization Register (GQR) decodificato
@@ -85,6 +98,7 @@ struct alignas(64) PPCContext {
     uint32_t     ctr;        // Count Register (cicli e salti indiretti)
     uint32_t     xer;        // Fixed-point Exception Register (carry, overflow, byte count)
     uint32_t     pc;         // Program Counter corrente
+    uint32_t     fpscr;      // Floating-Point Status and Control Register
     
     GQRRegister  gqr[8];     // Registri di Quantizzazione Grafica (GQR0 - GQR7, SPR 912 - 919)
 
@@ -97,6 +111,7 @@ struct alignas(64) PPCContext {
         ctr = 0;
         xer = 0;
         pc = 0;
+        fpscr = 0;
         for (int i = 0; i < 8; ++i) {
             gqr[i].SetRaw(0);
         }

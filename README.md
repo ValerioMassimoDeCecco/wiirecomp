@@ -167,3 +167,17 @@ InvertPitch=false
 ## 📄 Note Legali e Licenza
 
 Questo progetto è rilasciato per scopi di ricerca, preservazione e compatibilità software. Il repository include esclusivamente il codice sorgente del ricompilatore e del runtime; non sono inclusi binari o risorse coperte da copyright di Nintendo o di editori terzi.
+
+---
+
+## 🩺 Risoluzione Problemi
+
+### Schermata piena di rumore colorato (o scura) all'avvio di un `.dol`
+Il runtime mostra come immagine la memoria puntata dall'indirizzo XFB. Se quell'indirizzo e' sbagliato si vede "rumore".
+Cause tipiche e controlli:
+
+1. **`recompiled_game.cpp` vecchio.** Va rigenerato per *ogni* `.dol` (WiiRecomp Studio lo fa a ogni build, oppure `wiirecomp.exe gioco.dol recompiled_game.cpp`). Un `recompiled_game.cpp` generato da un altro DOL contiene hook per indirizzi che in questo DOL non esistono.
+2. **Funzioni libogc non riconosciute.** Il ricompilatore individua per *firma* (non per indirizzo) le funzioni da agganciare e stampa `[LIBOGC] Funzioni libogc riconosciute: N/M`. Se `VIDEO_SetNextFramebuffer` risulta non trovata, il DOL usa una versione di libogc diversa da quella di riferimento. Le firme si rigenerano con `python tools/gen_signatures.py recompiled_game.cpp include/libogc_signatures.hpp` partendo da un `recompiled_game.cpp` generato dal DOL di riferimento.
+3. **Console del gioco.** All'avvio vengono stampate le righe `[HOOKS] ...` e `[VI] XFB (...) = 0x...`: indicano quali hook sono attivi e quale framebuffer e' stato registrato. Il log completo e' in `native_runtime.log`.
+
+Il renderer non disegna piu' un XFB non valido (non allineato a 32 byte o fuori dalla RAM): in quel caso si vede solo lo sfondo scuro.

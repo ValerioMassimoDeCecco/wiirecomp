@@ -188,21 +188,23 @@ void CompilationTask(std::wstring dolPathStr) {
     AppendConsoleLog(L"[INFO] File DOL selezionato: " + dolPath.filename().wstring());
     AppendConsoleLog(L"[INFO] Directory radice progetto: " + root.wstring());
 
-    // 1. Individuazione wiirecomp.exe
+    // 1. Aggiornamento di wiirecomp.exe. Si ricompila SEMPRE (build incrementale, istantanea se gia' aggiornato):
+    //    usare un wiirecomp.exe vecchio rigenererebbe recompiled_game.cpp con la logica degli hook obsoleta.
+    AppendConsoleLog(L"[STEP 0] Aggiornamento di wiirecomp.exe (build incrementale)...");
     std::filesystem::path wiirecompExe = root / "build" / "Release" / "wiirecomp.exe";
+    std::wstring cmdBuildTool = L"cmake --build build --config Release --target wiirecomp";
+    bool toolBuilt = RunProcessCapture(cmdBuildTool, root);
     if (!std::filesystem::exists(wiirecompExe)) {
         wiirecompExe = root / "wiirecomp.exe";
     }
-
-    if (!std::filesystem::exists(wiirecompExe)) {
-        AppendConsoleLog(L"[STEP 0] wiirecomp.exe non trovato. Avvio compilazione di wiirecomp...");
-        std::wstring cmdBuildTool = L"cmake --build build --config Release --target wiirecomp";
-        if (!RunProcessCapture(cmdBuildTool, root)) {
+    if (!toolBuilt) {
+        if (std::filesystem::exists(wiirecompExe)) {
+            AppendConsoleLog(L"[ATTENZIONE] Aggiornamento di wiirecomp.exe fallito: uso la versione gia' presente (potrebbe essere obsoleta).");
+        } else {
             AppendConsoleLog(L"[FATALE] Impossibile compilare wiirecomp.exe!");
             PostMessageW(g_hWndMain, WM_APP_BUILD_DONE, FALSE, 0);
             return;
         }
-        wiirecompExe = root / "build" / "Release" / "wiirecomp.exe";
     }
 
     // 2. Esecuzione ricompilatore statico (PPC -> C++)
@@ -313,8 +315,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Abilita Drag and Drop
             DragAcceptFiles(hwnd, TRUE);
 
-            // Verifica se esiste già un boot.dol nella root
-            std::filesystem::path defaultDol = g_ProjectRoot / "boot.dol";
+            // Verifica se esiste un boot.dol (cerca nel percorso di test o nella cartella di build)
+            std::filesystem::path defaultDol = g_ProjectRoot / "channel-test" / "betterpii" / "apps" / "betterpii" / "boot.dol";
+            if (!std::filesystem::exists(defaultDol)) {
+                defaultDol = g_ProjectRoot / "build" / "Release" / "boot.dol";
+            }
+            if (!std::filesystem::exists(defaultDol)) {
+                defaultDol = g_ProjectRoot / "boot.dol";
+            }
             if (std::filesystem::exists(defaultDol)) {
                 g_SelectedDolPath = defaultDol.wstring();
                 SetWindowTextW(g_hEditDol, g_SelectedDolPath.c_str());
@@ -344,9 +352,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDROP hDrop = (HDROP)wParam;
             wchar_t filePath[MAX_PATH];
             if (DragQueryFileW(hDrop, 0, filePath, MAX_PATH)) {
-                g_SelectedDolPath = filePath;
-                SetWindowTextW(g_hEditDol, filePath);
-                SetWindowTextW(g_hStaticStatus, L"Stato: File caricato con successo!");
+                std::filesystem::path dropPath(filePath);
+                if (dropPath.extension() != L".dol" && dropPath.extension() != L".DOL") {
+                    MessageBoxW(hwnd, L"Puoi trascinare solo file eseguibili Nintendo Wii / GameCube (.dol)!\nNon trascinare eseguibili Windows (.exe).", L"File non valido", MB_OK | MB_ICONWARNING);
+                } else {
+                    g_SelectedDolPath = filePath;
+                    SetWindowTextW(g_hEditDol, filePath);
+                    SetWindowTextW(g_hStaticStatus, L"Stato: File caricato con successo!");
+                }
             }
             DragFinish(hDrop);
             return 0;
@@ -387,6 +400,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 if (g_SelectedDolPath.empty() || !std::filesystem::exists(g_SelectedDolPath)) {
                     MessageBoxW(hwnd, L"Seleziona un file .dol valido prima di avviare la compilazione!", L"Attenzione", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+
+                std::filesystem::path checkPath(g_SelectedDolPath);
+                if (checkPath.extension() != L".dol" && checkPath.extension() != L".DOL") {
+                    MessageBoxW(hwnd, L"Il file selezionato non e' un file .dol valido!\nAssicurati di selezionare un file .dol di un gioco Nintendo Wii / GameCube (es. boot.dol), non un eseguibile Windows (.exe).", L"File non valido", MB_OK | MB_ICONERROR);
                     return 0;
                 }
 

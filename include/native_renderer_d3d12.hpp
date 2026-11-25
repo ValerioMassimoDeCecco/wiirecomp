@@ -89,7 +89,7 @@ public:
     UINT64 fenceValue = 0;
 
     bool CreateXfbPipeline() {
-        // 1. Root Signature con 1 SRV (t0) e 1 Static Sampler (s0)
+        // 1. Root Signature con 1 SRV (t0), 1 Root Constant (b0, 4 float) e 1 Static Sampler (s0)
         D3D12_DESCRIPTOR_RANGE range = {};
         range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         range.NumDescriptors = 1;
@@ -97,11 +97,17 @@ public:
         range.RegisterSpace = 0;
         range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        D3D12_ROOT_PARAMETER rootParam = {};
-        rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rootParam.DescriptorTable.NumDescriptorRanges = 1;
-        rootParam.DescriptorTable.pDescriptorRanges = &range;
-        rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_PARAMETER rootParams[2] = {};
+        rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
+        rootParams[0].DescriptorTable.pDescriptorRanges = &range;
+        rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rootParams[1].Constants.ShaderRegister = 0;
+        rootParams[1].Constants.RegisterSpace = 0;
+        rootParams[1].Constants.Num32BitValues = 4;
+        rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_STATIC_SAMPLER_DESC sampler = {};
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -113,8 +119,8 @@ public:
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
-        rsDesc.NumParameters = 1;
-        rsDesc.pParameters = &rootParam;
+        rsDesc.NumParameters = 2;
+        rsDesc.pParameters = rootParams;
         rsDesc.NumStaticSamplers = 1;
         rsDesc.pStaticSamplers = &sampler;
         rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -136,6 +142,10 @@ public:
 
         // 2. Compilazione Shaders HLSL per Fullscreen Quad
         const char* xfbShaderCode = R"(
+            cbuffer XfbScale : register(b0) {
+                float2 u_UvScale;
+                float2 u_Pad;
+            };
             struct PS_INPUT {
                 float4 pos : SV_POSITION;
                 float2 uv  : TEXCOORD0;
@@ -149,7 +159,7 @@ public:
             Texture2D    g_Texture : register(t0);
             SamplerState g_Sampler : register(s0);
             float4 PSMain(PS_INPUT i) : SV_Target {
-                return g_Texture.Sample(g_Sampler, i.uv);
+                return g_Texture.Sample(g_Sampler, i.uv * u_UvScale);
             }
         )";
 
@@ -193,14 +203,18 @@ public:
         srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         if (FAILED(device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&srvHeap)))) return false;
 
-        // 5. Creazione XFB 2D Texture (640x480 RGBA8)
+        // 5. Creazione XFB 2D Texture (fino a 720x576 RGBA8 per NTSC/PAL)
+        static constexpr uint32_t MAX_XFB_TEX_W = 720;
+        static constexpr uint32_t MAX_XFB_TEX_H = 576;
+        static constexpr uint32_t MAX_XFB_ROW_PITCH = ((MAX_XFB_TEX_W * 4 + 255) & ~255u); // 3072
+
         D3D12_HEAP_PROPERTIES defaultHeapProps = {};
         defaultHeapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
 
         D3D12_RESOURCE_DESC texDesc = {};
         texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        texDesc.Width = 640;
-        texDesc.Height = 480;
+        texDesc.Width = MAX_XFB_TEX_W;
+        texDesc.Height = MAX_XFB_TEX_H;
         texDesc.DepthOrArraySize = 1;
         texDesc.MipLevels = 1;
         texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -221,13 +235,13 @@ public:
         srvDesc.Texture2D.MipLevels = 1;
         device->CreateShaderResourceView(xfbTexture, &srvDesc, srvHeap->GetCPUDescriptorHandleForHeapStart());
 
-        // 6. Creazione Upload Buffer per la texture (640 * 4 * 480 = 1228800 byte)
+        // 6. Creazione Upload Buffer per la texture
         D3D12_HEAP_PROPERTIES uploadHeapProps = {};
         uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
 
         D3D12_RESOURCE_DESC uploadDesc = {};
         uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        uploadDesc.Width = 640 * 480 * 4;
+        uploadDesc.Width = (UINT64)MAX_XFB_ROW_PITCH * MAX_XFB_TEX_H;
         uploadDesc.Height = 1;
         uploadDesc.DepthOrArraySize = 1;
         uploadDesc.MipLevels = 1;
@@ -322,28 +336,44 @@ public:
         return true;
     }
 
-    // Renderizza il framebuffer nativo Wii (XFB) e la geometria GX con VSync
-    void RenderFrame(const std::vector<UniversalVertex>& vertices, uint8_t* mem1 = nullptr, uint32_t fbAddr = 0) {
+    // Renderizza il framebuffer nativo Wii (XFB) con VSync.
+    void RenderFrame(const std::vector<UniversalVertex>& vertices, const uint8_t* xfb = nullptr,
+                     uint32_t fbWidth = 640, uint32_t fbHeight = 480) {
+        (void)vertices;
         if (!device || !swapChain || !commandAllocator || !commandList) return;
+
+        if (fbWidth < 16 || fbWidth > 720) fbWidth = 640;
+        if (fbHeight < 16 || fbHeight > 576) fbHeight = 480;
+        static constexpr uint32_t MAX_XFB_TEX_W = 720;
+        static constexpr uint32_t MAX_XFB_TEX_H = 576;
+        static constexpr uint32_t MAX_XFB_ROW_PITCH = ((MAX_XFB_TEX_W * 4 + 255) & ~255u);
 
         commandAllocator->Reset();
         commandList->Reset(commandAllocator, pipelineState);
 
-        // Se è presente un framebuffer XFB (da VI_SetFramebuffer / CON_Init / YUYV422), caricalo nella texture
-        if (fbAddr != 0 && mem1 != nullptr && xfbUpload && xfbTexture) {
+        bool xfbUploaded = false;
+        if (xfb != nullptr && xfbUpload && xfbTexture) {
             uint8_t* pUpload = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
             if (SUCCEEDED(xfbUpload->Map(0, &readRange, reinterpret_cast<void**>(&pUpload)))) {
-                const uint8_t* pSrc = mem1 + (fbAddr & 0x07FFFFFF);
-                uint32_t* pDst = reinterpret_cast<uint32_t*>(pUpload);
+                const uint8_t* pSrc = xfb;
+                const uint32_t dstStrideWords = MAX_XFB_ROW_PITCH / 4;
+                uint32_t* pDstBase = reinterpret_cast<uint32_t*>(pUpload);
 
-                for (uint32_t y = 0; y < 480; ++y) {
-                    for (uint32_t x = 0; x < 640; x += 2) {
+                for (uint32_t y = 0; y < fbHeight; ++y) {
+                    uint32_t* pDst = pDstBase + y * dstStrideWords;
+                    for (uint32_t x = 0; x + 1 < fbWidth; x += 2) {
                         uint8_t y0 = pSrc[0];
                         uint8_t u  = pSrc[1];
                         uint8_t y1 = pSrc[2];
                         uint8_t v  = pSrc[3];
                         pSrc += 4;
+
+                        if ((y0 | u | y1 | v) == 0) {
+                            pDst[x]     = 0xFF000000u;
+                            pDst[x + 1] = 0xFF000000u;
+                            continue;
+                        }
 
                         int c0 = (int)y0 - 16; if (c0 < 0) c0 = 0;
                         int c1 = (int)y1 - 16; if (c1 < 0) c1 = 0;
@@ -360,13 +390,12 @@ public:
                             return (0xFF000000u) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | (uint32_t)r;
                         };
 
-                        pDst[y * 640 + x]     = ToRgba(c0, d, e);
-                        pDst[y * 640 + x + 1] = ToRgba(c1, d, e);
+                        pDst[x]     = ToRgba(c0, d, e);
+                        pDst[x + 1] = ToRgba(c1, d, e);
                     }
                 }
                 xfbUpload->Unmap(0, nullptr);
 
-                // Barriera: da PIXEL_SHADER_RESOURCE a COPY_DEST
                 D3D12_RESOURCE_BARRIER bCopy = {};
                 bCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 bCopy.Transition.pResource = xfbTexture;
@@ -375,7 +404,6 @@ public:
                 bCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 commandList->ResourceBarrier(1, &bCopy);
 
-                // Copia da buffer a 2D texture (rowPitch = 640 * 4 = 2560)
                 D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
                 dstLoc.pResource = xfbTexture;
                 dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -386,17 +414,18 @@ public:
                 srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 srcLoc.PlacedFootprint.Offset = 0;
                 srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                srcLoc.PlacedFootprint.Footprint.Width = 640;
-                srcLoc.PlacedFootprint.Footprint.Height = 480;
+                srcLoc.PlacedFootprint.Footprint.Width = MAX_XFB_TEX_W;
+                srcLoc.PlacedFootprint.Footprint.Height = MAX_XFB_TEX_H;
                 srcLoc.PlacedFootprint.Footprint.Depth = 1;
-                srcLoc.PlacedFootprint.Footprint.RowPitch = 2560;
+                srcLoc.PlacedFootprint.Footprint.RowPitch = MAX_XFB_ROW_PITCH;
 
-                commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+                D3D12_BOX srcBox = { 0, 0, 0, fbWidth, fbHeight, 1 };
+                commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);
 
-                // Barriera: da COPY_DEST a PIXEL_SHADER_RESOURCE
                 bCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
                 bCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                 commandList->ResourceBarrier(1, &bCopy);
+                xfbUploaded = true;
             }
         }
 
@@ -414,14 +443,16 @@ public:
         rtvHandle.ptr += frameIndex * rtvDescriptorSize;
 
         commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
-        const float clearColor[] = { 0.05f, 0.05f, 0.05f, 1.0f }; // Nero elegante (mai bianco)
+        const float clearColor[] = { 0.05f, 0.05f, 0.05f, 1.0f };
         commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
 
-        if (fbAddr != 0 && srvHeap && pipelineState && rootSignature) {
+        if (xfbUploaded && srvHeap && pipelineState && rootSignature) {
             commandList->SetGraphicsRootSignature(rootSignature);
             ID3D12DescriptorHeap* ppHeaps[] = { srvHeap };
             commandList->SetDescriptorHeaps(1, ppHeaps);
             commandList->SetGraphicsRootDescriptorTable(0, srvHeap->GetGPUDescriptorHandleForHeapStart());
+            float uvConsts[4] = { (float)fbWidth / (float)MAX_XFB_TEX_W, (float)fbHeight / (float)MAX_XFB_TEX_H, 0.0f, 0.0f };
+            commandList->SetGraphicsRoot32BitConstants(1, 4, uvConsts, 0);
 
             D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
             D3D12_RECT sr = { 0, 0, (LONG)width, (LONG)height };

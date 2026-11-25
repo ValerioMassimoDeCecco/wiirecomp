@@ -52,9 +52,28 @@ public:
             return false;
         }
 
+        // Rifiuta esplicitamente file eseguibili Windows (MZ / PE)
+        const uint8_t* rawBytes = reinterpret_cast<const uint8_t*>(&rawHeader);
+        if (rawBytes[0] == 'M' && rawBytes[1] == 'Z') {
+            std::cerr << "[DOL] Errore: il file selezionato e' un eseguibile Windows (.exe), non un file .dol per GameCube/Wii!\n";
+            return false;
+        }
+
+        file.seekg(0, std::ios::end);
+        size_t fileSize = (size_t)file.tellg();
+        file.seekg(sizeof(DolHeaderRaw), std::ios::beg);
+
         entryPoint = WII_BYTESWAP32(rawHeader.entryPoint);
         bssAddress = WII_BYTESWAP32(rawHeader.bssAddress);
         bssSize    = WII_BYTESWAP32(rawHeader.bssSize);
+
+        // Verifica validita' dell'EntryPoint (deve risiedere nella memoria GameCube/Wii MEM1 o MEM2)
+        bool epValid = (entryPoint >= 0x80000000 && entryPoint < 0x81800000) ||
+                       (entryPoint >= 0x90000000 && entryPoint < 0x94000000);
+        if (!epValid) {
+            std::cerr << "[DOL] Errore: EntryPoint non valido (0x" << std::hex << entryPoint << "). Il file non e' un DOL valido.\n";
+            return false;
+        }
 
         sections.clear();
 
@@ -64,7 +83,7 @@ public:
             uint32_t addr   = WII_BYTESWAP32(rawHeader.textAddress[i]);
             uint32_t size   = WII_BYTESWAP32(rawHeader.textSize[i]);
 
-            if (offset > 0 && size > 0) {
+            if (offset >= 0x100 && size > 0 && (uint64_t)offset + size <= fileSize) {
                 DolSection sec;
                 sec.offset = offset;
                 sec.address = addr;
@@ -84,7 +103,7 @@ public:
             uint32_t addr   = WII_BYTESWAP32(rawHeader.dataAddress[i]);
             uint32_t size   = WII_BYTESWAP32(rawHeader.dataSize[i]);
 
-            if (offset > 0 && size > 0) {
+            if (offset >= 0x100 && size > 0 && (uint64_t)offset + size <= fileSize) {
                 DolSection sec;
                 sec.offset = offset;
                 sec.address = addr;
@@ -96,6 +115,11 @@ public:
                 file.read(reinterpret_cast<char*>(sec.data.data()), size);
                 sections.push_back(std::move(sec));
             }
+        }
+
+        if (sections.empty()) {
+            std::cerr << "[DOL] Errore: nessuna sezione eseguibile valida trovata nel file.\n";
+            return false;
         }
 
         char logBuf[256];
